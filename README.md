@@ -85,12 +85,6 @@ We wanted to create something truly unique—where real human behavior directly 
 
 ---
 
-## 📸 Screenshot
-
-![Blink Challenge Screenshot](./screenshot.png)
-
----
-
 ## 🙌 Acknowledgements
 
 - Built for fun and submitted to [Hackathon Name if applicable]
