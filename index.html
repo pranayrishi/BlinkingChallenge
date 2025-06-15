@@ -44,13 +44,18 @@
             z-index: 10;
         }
 
-        .score, .blinks, .difficulty {
+        .score, .blinks, .difficulty, .ear-display {
             background: rgba(0, 0, 0, 0.7);
             padding: 10px 15px;
             border-radius: 8px;
             margin-bottom: 10px;
             border-left: 4px solid #00ff88;
             backdrop-filter: blur(5px);
+        }
+
+        .ear-display {
+            border-left-color: #ffaa00;
+            font-size: 12px;
         }
 
         .blink-warning {
@@ -128,8 +133,8 @@
             position: absolute;
             top: 20px;
             right: 20px;
-            width: 160px;
-            height: 120px;
+            width: 200px;
+            height: 150px;
             border: 2px solid #00ff88;
             border-radius: 8px;
             overflow: hidden;
@@ -154,8 +159,34 @@
             border-radius: 4px;
         }
 
+        .eye-debug {
+            position: absolute;
+            bottom: 5px;
+            left: 5px;
+            color: #ffaa00;
+            font-size: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
         .hidden {
             display: none;
+        }
+
+        .loading-text {
+            color: #ffaa00;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+
+        #debugCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
         }
     </style>
 </head>
@@ -167,13 +198,19 @@
             <div class="score">Score: <span id="scoreValue">0</span></div>
             <div class="blinks">Blinks: <span id="blinkCount">0</span></div>
             <div class="difficulty">Level: <span id="difficultyLevel">1</span></div>
+            <div class="ear-display">
+                L-EAR: <span id="leftEAR">--</span><br>
+                R-EAR: <span id="rightEAR">--</span>
+            </div>
         </div>
 
         <div class="blink-warning" id="blinkWarning">BLINK DETECTED!</div>
 
         <div id="videoContainer">
-            <video id="video" autoplay muted></video>
-            <div class="camera-status" id="cameraStatus">Camera Loading...</div>
+            <video id="video" autoplay muted playsinline></video>
+            <canvas id="debugCanvas"></canvas>
+            <div class="camera-status" id="cameraStatus">Loading AI...</div>
+            <div class="eye-debug" id="eyeDebug">Initializing...</div>
         </div>
 
         <div class="start-screen" id="startScreen">
@@ -182,7 +219,8 @@
             <p>👁️ <strong>Warning:</strong> Every time you BLINK, the game gets harder!</p>
             <p>🎮 <strong>Controls:</strong> Use arrow keys or WASD to move your spaceship</p>
             <p>💡 <strong>Strategy:</strong> Try not to blink, but good luck with that! 😉</p>
-            <button class="start-btn" onclick="startGame()">🚀 Start Mission</button>
+            <p class="loading-text">🤖 Advanced AI eye tracking powered by MediaPipe</p>
+            <button class="start-btn" onclick="startGame()" id="startButton" disabled>🚀 Loading...</button>
         </div>
 
         <div class="game-over-screen hidden" id="gameOverScreen">
@@ -193,11 +231,19 @@
         </div>
     </div>
 
+    <!-- MediaPipe Face Mesh from official CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
     <script>
         // Game variables
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
         const video = document.getElementById('video');
+        const debugCanvas = document.getElementById('debugCanvas');
+        const debugCtx = debugCanvas.getContext('2d');
         
         let gameRunning = false;
         let score = 0;
@@ -221,6 +267,21 @@
         let particles = [];
         let stars = [];
         
+        // Eye tracking variables
+        let faceMesh;
+        let camera;
+        let leftEAR = 0;
+        let rightEAR = 0;
+        let earHistory = [];
+        let blinkThreshold = 0.21;
+        let blinkCooldown = 0;
+        let isBlinking = false;
+        let faceDetected = false;
+        
+        // Eye landmark indices for MediaPipe Face Mesh (468 landmarks model)
+        const LEFT_EYE_LANDMARKS = [362, 385, 387, 263, 373, 380];
+        const RIGHT_EYE_LANDMARKS = [33, 160, 158, 133, 153, 144];
+        
         // Input handling
         const keys = {};
         document.addEventListener('keydown', (e) => keys[e.key.toLowerCase()] = true);
@@ -239,76 +300,209 @@
             }
         }
         
-        // Camera and blink detection
-        let lastEyeState = null;
-        let eyeClosedFrames = 0;
-        let blinkCooldown = 0;
-        
-        async function setupCamera() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-                video.srcObject = stream;
-                video.play();
-                
-                document.getElementById('cameraStatus').textContent = 'Camera Active';
-                document.getElementById('cameraStatus').style.color = '#00ff88';
-                
-                // Start blink detection
-                detectBlinks();
-            } catch (error) {
-                console.error('Camera access denied:', error);
-                document.getElementById('cameraStatus').textContent = 'Camera Disabled';
-                document.getElementById('cameraStatus').style.color = '#ff4444';
-            }
+        // Calculate distance between two points
+        function distance(p1, p2) {
+            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
         }
         
-        function detectBlinks() {
-            if (!video.videoWidth || !gameRunning) {
-                requestAnimationFrame(detectBlinks);
-                return;
-            }
+        // Calculate Eye Aspect Ratio (EAR)
+        function calculateEAR(eyeLandmarks) {
+            if (eyeLandmarks.length !== 6) return 0;
             
-            // Simple blink detection using video brightness
-            const tempCanvas = document.createElement('canvas');
-            const tempCtx = tempCanvas.getContext('2d');
-            tempCanvas.width = 50;
-            tempCanvas.height = 50;
+            // Vertical distances
+            const vertical1 = distance(eyeLandmarks[1], eyeLandmarks[5]);
+            const vertical2 = distance(eyeLandmarks[2], eyeLandmarks[4]);
             
-            tempCtx.drawImage(video, 0, 0, 50, 50);
-            const imageData = tempCtx.getImageData(0, 0, 50, 50);
+            // Horizontal distance
+            const horizontal = distance(eyeLandmarks[0], eyeLandmarks[3]);
             
-            let brightness = 0;
-            for (let i = 0; i < imageData.data.length; i += 4) {
-                brightness += (imageData.data[i] + imageData.data[i + 1] + imageData.data[i + 2]) / 3;
-            }
-            brightness /= (imageData.data.length / 4);
+            // EAR formula: EAR = (||p1-p4|| + ||p3-p5||) / (2 * ||p2-p6||)
+            const ear = (vertical1 + vertical2) / (2.0 * horizontal);
+            return ear;
+        }
+        
+        // MediaPipe Face Mesh results callback
+        function onResults(results) {
+            // Set debug canvas size to match video
+            debugCanvas.width = video.videoWidth || 200;
+            debugCanvas.height = video.videoHeight || 150;
             
-            // Detect significant brightness drop (closed eyes)
-            if (brightness < 80 && lastEyeState !== 'closed') {
-                eyeClosedFrames++;
-                if (eyeClosedFrames > 3 && blinkCooldown <= 0) {
-                    onBlinkDetected();
-                    blinkCooldown = 30; // Prevent rapid fire blink detection
+            // Clear debug canvas
+            debugCtx.clearRect(0, 0, debugCanvas.width, debugCanvas.height);
+            debugCtx.save();
+            
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                faceDetected = true;
+                const landmarks = results.multiFaceLandmarks[0];
+                
+                // Convert normalized coordinates to pixel coordinates
+                const leftEyeLandmarks = LEFT_EYE_LANDMARKS.map(index => ({
+                    x: landmarks[index].x * debugCanvas.width,
+                    y: landmarks[index].y * debugCanvas.height
+                }));
+                
+                const rightEyeLandmarks = RIGHT_EYE_LANDMARKS.map(index => ({
+                    x: landmarks[index].x * debugCanvas.width,
+                    y: landmarks[index].y * debugCanvas.height
+                }));
+                
+                // Calculate EAR for both eyes
+                leftEAR = calculateEAR(leftEyeLandmarks);
+                rightEAR = calculateEAR(rightEyeLandmarks);
+                
+                // Average EAR
+                const avgEAR = (leftEAR + rightEAR) / 2;
+                
+                // Update EAR history for smoothing
+                earHistory.push(avgEAR);
+                if (earHistory.length > 5) {
+                    earHistory.shift();
                 }
-            } else if (brightness >= 80) {
-                lastEyeState = 'open';
-                eyeClosedFrames = 0;
+                
+                // Smooth EAR value
+                const smoothEAR = earHistory.reduce((a, b) => a + b, 0) / earHistory.length;
+                
+                // Detect blink
+                if (smoothEAR < blinkThreshold && !isBlinking && blinkCooldown <= 0) {
+                    isBlinking = true;
+                    onBlinkDetected();
+                    blinkCooldown = 30;
+                } else if (smoothEAR > blinkThreshold + 0.05) {
+                    isBlinking = false;
+                }
+                
+                if (blinkCooldown > 0) blinkCooldown--;
+                
+                // Update UI
+                document.getElementById('leftEAR').textContent = leftEAR.toFixed(3);
+                document.getElementById('rightEAR').textContent = rightEAR.toFixed(3);
+                document.getElementById('eyeDebug').textContent = `EAR: ${smoothEAR.toFixed(3)}`;
+                document.getElementById('cameraStatus').textContent = 'AI Tracking Active';
+                document.getElementById('cameraStatus').style.color = '#00ff88';
+                
+                // Draw eye landmarks for debugging
+                debugCtx.fillStyle = '#00ff88';
+                debugCtx.strokeStyle = isBlinking ? '#ff4444' : '#00ff88';
+                debugCtx.lineWidth = 2;
+                
+                // Draw left eye
+                debugCtx.beginPath();
+                leftEyeLandmarks.forEach((point, index) => {
+                    debugCtx.fillRect(point.x - 1, point.y - 1, 2, 2);
+                    if (index === 0) debugCtx.moveTo(point.x, point.y);
+                    else debugCtx.lineTo(point.x, point.y);
+                });
+                debugCtx.closePath();
+                debugCtx.stroke();
+                
+                // Draw right eye
+                debugCtx.beginPath();
+                rightEyeLandmarks.forEach((point, index) => {
+                    debugCtx.fillRect(point.x - 1, point.y - 1, 2, 2);
+                    if (index === 0) debugCtx.moveTo(point.x, point.y);
+                    else debugCtx.lineTo(point.x, point.y);
+                });
+                debugCtx.closePath();
+                debugCtx.stroke();
+                
+            } else {
+                faceDetected = false;
+                document.getElementById('eyeDebug').textContent = 'No face detected';
+                document.getElementById('leftEAR').textContent = '--';
+                document.getElementById('rightEAR').textContent = '--';
             }
             
-            if (blinkCooldown > 0) blinkCooldown--;
-            
-            requestAnimationFrame(detectBlinks);
+            debugCtx.restore();
+        }
+        
+        // Setup camera and MediaPipe
+        async function setupFaceTracking() {
+            try {
+                document.getElementById('cameraStatus').textContent = 'Starting camera...';
+                
+                // Request camera access first
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: 640, 
+                        height: 480,
+                        facingMode: 'user'
+                    } 
+                });
+                
+                video.srcObject = stream;
+                await new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        video.play();
+                        resolve();
+                    };
+                });
+                
+                document.getElementById('cameraStatus').textContent = 'Loading AI model...';
+                
+                // Wait for MediaPipe to be available
+                if (typeof FaceMesh === 'undefined') {
+                    throw new Error('MediaPipe FaceMesh not loaded');
+                }
+                
+                // Initialize MediaPipe Face Mesh
+                faceMesh = new FaceMesh({
+                    locateFile: (file) => {
+                        return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+                    }
+                });
+                
+                await faceMesh.setOptions({
+                    maxNumFaces: 1,
+                    refineLandmarks: true,
+                    minDetectionConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+                
+                faceMesh.onResults(onResults);
+                
+                // Start processing
+                document.getElementById('cameraStatus').textContent = 'AI model loaded';
+                
+                // Process video frames
+                async function processFrame() {
+                    if (video.readyState === 4) {
+                        await faceMesh.send({ image: video });
+                    }
+                    requestAnimationFrame(processFrame);
+                }
+                
+                processFrame();
+                
+                // Enable start button
+                setTimeout(() => {
+                    document.getElementById('startButton').disabled = false;
+                    document.getElementById('startButton').textContent = '🚀 Start Mission';
+                    document.getElementById('cameraStatus').textContent = 'AI Ready';
+                }, 2000);
+                
+            } catch (error) {
+                console.error('Face tracking setup failed:', error);
+                document.getElementById('cameraStatus').textContent = 'Tracking Failed';
+                document.getElementById('cameraStatus').style.color = '#ff4444';
+                document.getElementById('eyeDebug').textContent = error.message;
+                
+                // Enable start button anyway (fallback mode)
+                document.getElementById('startButton').disabled = false;
+                document.getElementById('startButton').textContent = '🚀 Start (No Tracking)';
+            }
         }
         
         function onBlinkDetected() {
             if (!gameRunning) return;
             
+            console.log('Blink detected!'); // Debug log
+            
             blinkCount++;
             difficultyLevel = Math.floor(blinkCount / 3) + 1;
             
             // Increase difficulty
-            asteroidSpeed += 0.5;
-            asteroidSpawnRate += 0.005;
+            asteroidSpeed += 0.8;
+            asteroidSpawnRate += 0.008;
             
             // Show blink warning
             const warning = document.getElementById('blinkWarning');
@@ -500,6 +694,8 @@
         }
         
         function startGame() {
+            if (document.getElementById('startButton').disabled) return;
+            
             gameRunning = true;
             score = 0;
             blinkCount = 0;
@@ -508,6 +704,7 @@
             asteroidSpawnRate = 0.02;
             asteroids = [];
             particles = [];
+            earHistory = [];
             
             player.x = canvas.width / 2 - 15;
             player.y = canvas.height - 80;
@@ -522,7 +719,8 @@
             const finalStats = `
                 Final Score: ${score}<br>
                 Total Blinks: ${blinkCount}<br>
-                Difficulty Reached: Level ${difficultyLevel}
+                Difficulty Reached: Level ${difficultyLevel}<br>
+                Face Detected: ${faceDetected ? 'Yes' : 'No'}
             `;
             
             document.getElementById('finalStats').innerHTML = finalStats;
@@ -534,10 +732,12 @@
             startGame();
         }
         
-        // Initialize game
-        setupCamera();
-        initStars();
-        gameLoop();
+        // Initialize everything
+        window.addEventListener('load', () => {
+            setupFaceTracking();
+            initStars();
+            gameLoop();
+        });
     </script>
 </body>
 </html>
